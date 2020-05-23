@@ -20,21 +20,9 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
-RTC_DATA_ATTR int bootCount = 0;
+// ---------------------------------------------------------------------------------------------------------------
 
-extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
-extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
-
-
-/* FreeRTOS event group to signal when we are connected*/
-static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "first-test";
-
-/* The event group allows multiple bits for each event, but we only care about two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
 
 #define LWIP_LOCAL_HOSTNAME "esp32player1"
 
@@ -49,25 +37,10 @@ static const char *TAG = "first-test";
 
 // GPIO 32 (where to plug a PIR: passive infra red detector, XXX: I choose 32 because it allow device wake up notification)
 #define GPIO_MOVEMENT_DETECTOR     32
-#define GPIO_INPUT_PIN_SEL  (1ULL<<GPIO_BUTTON_BOOT | 1ULL<<GPIO_MOVEMENT_DETECTOR)
 
-#define ESP_INTR_FLAG_DEFAULT 0
-
-#define MAX_HTTP_OUTPUT_BUFFER 2048
-
-static xQueueHandle gpio_evt_queue = NULL;
-time_t last_alarm = 0; 
 
 
 #define BUFFSIZE 1024
-#define HASH_LEN 32 /* SHA-256 digest length */
-
-/*an ota data write buffer ready to write to the flash*/
-static char ota_write_data[BUFFSIZE + 1] = { 0 };
-extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
-extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
-
-#define OTA_URL_SIZE 256
 
 //  ----------------------------------------------------------------------------------- helpers
 
@@ -105,6 +78,16 @@ static bool lazy_http_request(const char* url)
 }
 
 
+// -------------------------------------------------------------------------------- OTA functions
+
+/*an ota data write buffer ready to write to the flash*/
+static char ota_write_data[BUFFSIZE + 1] = { 0 };
+extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
+extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
+
+#define OTA_URL_SIZE 256
+
+#define HASH_LEN 32 /* SHA-256 digest length */
 static void print_sha256 (const uint8_t *image_hash, const char *label)
 {
     char hash_print[HASH_LEN * 2 + 1];
@@ -125,7 +108,7 @@ static void __attribute__((noreturn)) ota_task_fatal_error(void)
     }
 }
 
-static void ota_infinite_loop(void)
+static void __attribute__((noreturn)) ota_stop_task(void)
 {
     ESP_LOGI(TAG, "When a new firmware is available on the server, press the reset button to download it");
     (void)vTaskDelete(NULL);
@@ -135,14 +118,14 @@ static void ota_infinite_loop(void)
     }
 }
 
-static void ota_example_task(void *pvParameter)
+static void ota_task(void *pvParameter)
 {
     esp_err_t err;
     /* update handle : set by esp_ota_begin(), must be freed via esp_ota_end() */
     esp_ota_handle_t update_handle = 0 ;
     const esp_partition_t *update_partition = NULL;
 
-    ESP_LOGI(TAG, "Starting OTA example");
+    ESP_LOGI(TAG, "Starting OTA");
 
     const esp_partition_t *configured = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -218,14 +201,14 @@ static void ota_example_task(void *pvParameter)
                             ESP_LOGW(TAG, "Previously, there was an attempt to launch the firmware with %s version, but it failed.", invalid_app_info.version);
                             ESP_LOGW(TAG, "The firmware has been rolled back to the previous version.");
                             http_cleanup(client);
-                            ota_infinite_loop();
+                            ota_stop_task();
                         }
                     }
 #ifndef CONFIG_SKIP_VERSION_CHECK
                     if (memcmp(new_app_info.version, running_app_info.version, sizeof(new_app_info.version)) == 0) {
-                        ESP_LOGW(TAG, "Current running version is the same as a new. We will not continue the update.");
+                        ESP_LOGI(TAG, "Current running version is the same as a new. We will not continue the update.");
                         http_cleanup(client);
-                        ota_infinite_loop();
+                        ota_stop_task();
                     }
 #endif
 
@@ -360,86 +343,17 @@ static void check_image()
     }
 }
 
-void got_movement() {
-	    time_t now; 
-	    time( &now);
-	    ESP_LOGI( TAG, "Movement detected");
+// -------------------------------------------------------------------------- wifi
 
-	    if ((last_alarm == 0) || ((now - last_alarm) > CONFIG_ESP_ALARM_FLODDING_PROTECTION)) {
-		ESP_LOGI( TAG, "Movement: call webhook");
-		last_alarm = now; 
-		lazy_http_request( MOVEMENT_URL);
-	    }
+/* The event group allows multiple bits for each event, but we only care about two events:
+ * - we are connected to the AP with an IP
+ * - we failed to connect after the maximum amount of retries */
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
 
-}
-void go_to_bed() {
-
-	ESP_LOGI( TAG, "Starting low consumption mode (deep sleep)");
-
-
-	//release Wifi driver
-	esp_wifi_stop();
-	esp_wifi_deinit();
-
-	esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-
-	//scheddule a wake up for watchdog + periodic check
-	esp_sleep_enable_timer_wakeup( (uint64_t)CONFIG_ESP_WATCHDOG_WAKEUP * (uint64_t)1000000); 
-
-	//Warning: can only take in consideration RTC GPIO: 0,2,4,12-15,25-27,32-39
-	//esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_BUTTON_BOOT, ESP_EXT1_WAKEUP_ALL_LOW);
-
-	//will wake up on any movement (GPIO going UP)
-	esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_MOVEMENT_DETECTOR, ESP_EXT1_WAKEUP_ANY_HIGH);
-	esp_sleep_enable_gpio_wakeup();
-
-	esp_deep_sleep_start(); //deep sleep
-
-}
-void ping() {
-	ESP_LOGI( TAG, "ping (calling webhook)");
-	lazy_http_request( PING_URL);
-}
-
-static void IRAM_ATTR gpio_isr_handler(void* arg)
-{
-    uint32_t gpio_num = (uint32_t) arg;
-    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
-}
-
-static void gpio_task_example(void* arg)
-{
-    uint32_t io_num;
-    for(;;) {
-        if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-
-	    //uint32_t level = gpio_get_level( io_num);
-            //ESP_LOGI(TAG, "debug: GPIO[%d] intr, val: %d", io_num, level);
-
-	    switch ( io_num) {
-
-		case GPIO_BUTTON_BOOT:
-		    ESP_LOGI( TAG, "Button BOOT released");
-		    ping();
-		    go_to_bed();
-		    break;
-
-		case GPIO_MOVEMENT_DETECTOR:
-		    ESP_LOGI( TAG, "Got movement");
-		    got_movement();
-		    break;
-
-		default:
-		    ESP_LOGI( TAG, "Strange case: got unexpected notification on GPIO %d", io_num);
-
-	    }
-
-        }
-    }
-}
-
-
-static int s_retry_num = 0;
+/* FreeRTOS event group to signal when we are connected*/
+static EventGroupHandle_t s_wifi_event_group;
+static int s_wifi_retry_num = 0;
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -447,9 +361,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < CONFIG_ESP_MAXIMUM_RETRY) {
+        if (s_wifi_retry_num < CONFIG_ESP_MAXIMUM_RETRY) {
             esp_wifi_connect();
-            s_retry_num++;
+            s_wifi_retry_num++;
             ESP_LOGI(TAG, "retry to connect to the AP");
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -458,12 +372,18 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
+        s_wifi_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-void wifi_init_sta(void)
+void wifi_stop() {
+	esp_wifi_stop();
+	esp_wifi_deinit();
+}
+
+
+void wifi_start(void)
 {
     s_wifi_event_group = xEventGroupCreate();
 
@@ -528,6 +448,98 @@ void wifi_init_sta(void)
     vEventGroupDelete(s_wifi_event_group);
 }
 
+// -------------------------------------------------------------------------- main functions
+
+time_t last_alarm = 0; 
+
+void got_movement() {
+	    time_t now; 
+	    time( &now);
+	    ESP_LOGI( TAG, "Movement detected");
+
+	    if ((last_alarm == 0) || ((now - last_alarm) > CONFIG_ESP_ALARM_FLODDING_PROTECTION)) {
+		ESP_LOGI( TAG, "Movement: call webhook");
+		last_alarm = now; 
+		lazy_http_request( MOVEMENT_URL);
+	    }
+
+}
+
+void go_to_bed() {
+
+	ESP_LOGI( TAG, "Starting low consumption mode (deep sleep)");
+
+	//release Wifi driver
+	wifi_stop();
+
+	esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+	//scheddule a wake up for watchdog + periodic check
+	esp_sleep_enable_timer_wakeup( (uint64_t)CONFIG_ESP_WATCHDOG_WAKEUP * (uint64_t)1000000); 
+
+	//Warning: can only take in consideration RTC GPIO: 0,2,4,12-15,25-27,32-39
+	//esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_BUTTON_BOOT, ESP_EXT1_WAKEUP_ALL_LOW);
+
+	//will wake up on any movement (GPIO going UP)
+	esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_MOVEMENT_DETECTOR, ESP_EXT1_WAKEUP_ANY_HIGH);
+	esp_sleep_enable_gpio_wakeup();
+
+	esp_deep_sleep_start(); //deep sleep
+
+}
+
+void ping() {
+	ESP_LOGI( TAG, "ping (calling webhook)");
+	lazy_http_request( PING_URL);
+}
+
+
+// -------------------------------------------------------------------------------- gpio
+
+
+#define GPIO_INPUT_PIN_SEL  (1ULL<<GPIO_BUTTON_BOOT | 1ULL<<GPIO_MOVEMENT_DETECTOR)
+#define ESP_INTR_FLAG_DEFAULT 0
+
+static xQueueHandle gpio_evt_queue = NULL;
+
+static void IRAM_ATTR gpio_isr_handler(void* arg)
+{
+    uint32_t gpio_num = (uint32_t) arg;
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+static void gpio_task(void* arg)
+{
+    uint32_t io_num;
+    for(;;) {
+
+        if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+
+	    //uint32_t level = gpio_get_level( io_num);
+            //ESP_LOGI(TAG, "debug: GPIO[%d] intr, val: %d", io_num, level);
+
+	    switch ( io_num) {
+
+		case GPIO_BUTTON_BOOT:
+		    ESP_LOGI( TAG, "Button BOOT released");
+		    ping();
+		    go_to_bed();
+		    break;
+
+		case GPIO_MOVEMENT_DETECTOR:
+		    ESP_LOGI( TAG, "Got movement");
+		    got_movement();
+		    break;
+
+		default:
+		    ESP_LOGI( TAG, "Strange case: got unexpected notification on GPIO %d", io_num);
+
+	    }
+
+        }
+    }
+}
+
 void init_gpio(void)
 {
 
@@ -535,12 +547,16 @@ void init_gpio(void)
 
     //interrupt of rising edge
     io_conf.intr_type = GPIO_PIN_INTR_POSEDGE;
+
     //bit mask of the pins, use GPIO4/5 here
     io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+
     //set as input mode
     io_conf.mode = GPIO_MODE_INPUT;
+
     //enable pull-up mode
     io_conf.pull_up_en = 1;
+
     gpio_config(&io_conf);
 
      //change gpio intrrupt type for one pin
@@ -551,7 +567,7 @@ void init_gpio(void)
     //create a queue to handle gpio event from isr
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     //start gpio task
-    xTaskCreate(gpio_task_example, "gpio_task_example", 2048, NULL, 10, NULL);
+    xTaskCreate(gpio_task, "gpio_task", 2048, NULL, 10, NULL);
 
     //install gpio isr service
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
@@ -560,6 +576,11 @@ void init_gpio(void)
     gpio_isr_handler_add(GPIO_MOVEMENT_DETECTOR, gpio_isr_handler, (void*) GPIO_MOVEMENT_DETECTOR);
 
 }
+
+
+// -------------------------------------------------------------------------- app_main
+
+RTC_DATA_ATTR int bootCount = 0;
 
 void app_main(void)
 {
@@ -575,7 +596,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     //Initialize Wifi
-    wifi_init_sta();
+    wifi_start();
 
     //Initialize GPIO
     init_gpio();
@@ -613,7 +634,8 @@ void app_main(void)
 
     int cnt = 0;
 
-    xTaskCreate(&ota_example_task, "ota_example_task", 8192, NULL, 5, NULL);
+    //FIXME do we need to check OTA immediately ?
+    xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
 
     while(1) {
 
