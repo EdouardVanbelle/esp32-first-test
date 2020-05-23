@@ -135,15 +135,18 @@ void go_to_bed() {
 
 	    printf( "Starting low consumption mode (deep sleep)\n");
 
+	    
+	    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+	    //or will wake up after to start a ping (watchdog)
+	    esp_sleep_enable_timer_wakeup( (uint64_t)WATCHDOG_PING * (uint64_t)1000000); 
+
 	    //Warning: can only take in consideration RTC GPIO: 0,2,4,12-15,25-27,32-39
 	    //esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_BUTTON_BOOT, ESP_EXT1_WAKEUP_ALL_LOW);
 	    
 	    //will wake up on any movement (GPIO going UP)
 	    esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_MOVEMENT_DETECTOR, ESP_EXT1_WAKEUP_ANY_HIGH);
 	    esp_sleep_enable_gpio_wakeup();
-
-	    //or will wake up after to start a ping (watchdog)
-	    esp_sleep_enable_timer_wakeup( WATCHDOG_PING * 1000000); 
 
 	    esp_deep_sleep_start(); //deep sleep
 
