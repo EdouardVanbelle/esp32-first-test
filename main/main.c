@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "driver/gpio.h"
-#include "mdns.h"
 
 #include "esp_netif.h"
 #include "esp_http_client.h"
@@ -302,21 +301,6 @@ static bool diagnostic(void)
     */
 }
 
-void start_mdns_service()
-{
-    //initialize mDNS service
-    esp_err_t err = mdns_init();
-    if (err) {
-        printf("MDNS Init failed: %d\n", err);
-        return;
-    }
-
-    //set hostname
-    mdns_hostname_set( LWIP_LOCAL_HOSTNAME);
-    //set default instance
-    mdns_instance_name_set("Ed's ESP32");
-}
-
 void http_request(const char* url)
 {
     //char local_response_buffer[MAX_HTTP_OUTPUT_BUFFER] = {0};
@@ -448,8 +432,6 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-
-	start_mdns_service();
     }
 }
 
