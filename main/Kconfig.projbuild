@@ -17,6 +17,19 @@ config ESP_MAXIMUM_RETRY
         default 5
         help
             Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
+
+config EXAMPLE_FIRMWARE_UPG_URL
+        string "Firmware Upgrade URL"
+        default "http://192.168.2.2/firmware/first-test.bin"
+        help
+            URL of server which hosts the firmware image.
+
+config EXAMPLE_OTA_RECV_TIMEOUT
+        int "OTA Receive Timeout"
+        default 5000
+        help
+            Maximum time for reception
+
 endmenu
 
     
