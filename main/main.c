@@ -26,14 +26,6 @@ extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
 
 
-/* The examples use WiFi configuration that you can set via project configuration menu
-   If you'd rather not, just change the below entries to strings with
-   the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
-*/
-#define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
-#define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
-#define EXAMPLE_ESP_MAXIMUM_RETRY  CONFIG_ESP_MAXIMUM_RETRY
-
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "first-test";
@@ -44,7 +36,6 @@ static const char *TAG = "first-test";
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-//FIXME
 #define LWIP_LOCAL_HOSTNAME "esp32player1"
 
 //#define GO_SLEEP_URL "http://nuc.lan/api/bose/Bose-Bureau/notify/shut"
@@ -60,18 +51,12 @@ static const char *TAG = "first-test";
 #define GPIO_MOVEMENT_DETECTOR     32
 #define GPIO_INPUT_PIN_SEL  (1ULL<<GPIO_BUTTON_BOOT | 1ULL<<GPIO_MOVEMENT_DETECTOR)
 
-//#define GPIO_OUTPUT_IO_0     0
-//#define GPIO_OUTPUT_PIN_SEL  (1ULL<<GPIO_OUTPUT_IO_0)
-
 #define ESP_INTR_FLAG_DEFAULT 0
 
 #define MAX_HTTP_OUTPUT_BUFFER 2048
 
 static xQueueHandle gpio_evt_queue = NULL;
 time_t last_alarm = 0; 
-// wait ALARM_TRIGGER second before sending a new one
-#define ALARM_FLODDING_PROTECTION 30 
-#define WATCHDOG_PING 3600
 
 
 #define BUFFSIZE 1024
@@ -84,21 +69,41 @@ extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
 
 #define OTA_URL_SIZE 256
 
+//  ----------------------------------------------------------------------------------- helpers
+
 static void http_cleanup(esp_http_client_handle_t client)
 {
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 }
 
-static void __attribute__((noreturn)) task_fatal_error(void)
-{
-    ESP_LOGE(TAG, "Exiting task due to fatal error...");
-    (void)vTaskDelete(NULL);
 
-    while (1) {
-        ;
+static bool lazy_http_request(const char* url)
+{
+
+    ESP_LOGI(TAG, "HTTP GET start query %s", url);
+    esp_http_client_config_t config = {
+        .url = url,
+    };
+    esp_http_client_handle_t client = esp_http_client_init( &config);
+
+    // GET
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d",
+                esp_http_client_get_status_code(client),
+                esp_http_client_get_content_length(client));
+    } else {
+        ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
     }
+    //ESP_LOG_BUFFER_HEX(TAG, local_response_buffer, strlen(local_response_buffer));
+    
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    return (err == ESP_OK);
 }
+
 
 static void print_sha256 (const uint8_t *image_hash, const char *label)
 {
@@ -110,7 +115,17 @@ static void print_sha256 (const uint8_t *image_hash, const char *label)
     ESP_LOGI(TAG, "%s: %s", label, hash_print);
 }
 
-static void infinite_loop(void)
+static void __attribute__((noreturn)) ota_task_fatal_error(void)
+{
+    ESP_LOGE(TAG, "Exiting task due to fatal error...");
+    (void)vTaskDelete(NULL);
+
+    while (1) {
+        ;
+    }
+}
+
+static void ota_infinite_loop(void)
 {
     ESP_LOGI(TAG, "When a new firmware is available on the server, press the reset button to download it");
     (void)vTaskDelete(NULL);
@@ -141,25 +156,25 @@ static void ota_example_task(void *pvParameter)
              running->type, running->subtype, running->address);
 
     esp_http_client_config_t config = {
-        .url = CONFIG_EXAMPLE_FIRMWARE_UPG_URL,
+        .url = CONFIG_ESP_FIRMWARE_UPG_URL,
         .cert_pem = (char *)server_cert_pem_start,
-        .timeout_ms = CONFIG_EXAMPLE_OTA_RECV_TIMEOUT,
+        .timeout_ms = CONFIG_ESP_OTA_RECV_TIMEOUT,
     };
 
-//#ifdef CONFIG_EXAMPLE_SKIP_COMMON_NAME_CHECK
+//#ifdef CONFIG_SKIP_COMMON_NAME_CHECK
     config.skip_cert_common_name_check = true;
 //#endif
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
         ESP_LOGE(TAG, "Failed to initialise HTTP connection");
-        task_fatal_error();
+        ota_task_fatal_error();
     }
     err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
-        task_fatal_error();
+        ota_task_fatal_error();
     }
     esp_http_client_fetch_headers(client);
 
@@ -176,7 +191,7 @@ static void ota_example_task(void *pvParameter)
         if (data_read < 0) {
             ESP_LOGE(TAG, "Error: SSL data read error");
             http_cleanup(client);
-            task_fatal_error();
+            ota_task_fatal_error();
         } else if (data_read > 0) {
             if (image_header_was_checked == false) {
                 esp_app_desc_t new_app_info;
@@ -203,14 +218,14 @@ static void ota_example_task(void *pvParameter)
                             ESP_LOGW(TAG, "Previously, there was an attempt to launch the firmware with %s version, but it failed.", invalid_app_info.version);
                             ESP_LOGW(TAG, "The firmware has been rolled back to the previous version.");
                             http_cleanup(client);
-                            infinite_loop();
+                            ota_infinite_loop();
                         }
                     }
-#ifndef CONFIG_EXAMPLE_SKIP_VERSION_CHECK
+#ifndef CONFIG_SKIP_VERSION_CHECK
                     if (memcmp(new_app_info.version, running_app_info.version, sizeof(new_app_info.version)) == 0) {
                         ESP_LOGW(TAG, "Current running version is the same as a new. We will not continue the update.");
                         http_cleanup(client);
-                        infinite_loop();
+                        ota_infinite_loop();
                     }
 #endif
 
@@ -220,19 +235,19 @@ static void ota_example_task(void *pvParameter)
                     if (err != ESP_OK) {
                         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
                         http_cleanup(client);
-                        task_fatal_error();
+                        ota_task_fatal_error();
                     }
                     ESP_LOGI(TAG, "esp_ota_begin succeeded");
                 } else {
                     ESP_LOGE(TAG, "received package is not fit len");
                     http_cleanup(client);
-                    task_fatal_error();
+                    ota_task_fatal_error();
                 }
             }
             err = esp_ota_write( update_handle, (const void *)ota_write_data, data_read);
             if (err != ESP_OK) {
                 http_cleanup(client);
-                task_fatal_error();
+                ota_task_fatal_error();
             }
             binary_file_length += data_read;
             ESP_LOGD(TAG, "Written image length %d", binary_file_length);
@@ -255,7 +270,7 @@ static void ota_example_task(void *pvParameter)
     if (esp_http_client_is_complete_data_received(client) != true) {
         ESP_LOGE(TAG, "Error in receiving complete file");
         http_cleanup(client);
-        task_fatal_error();
+        ota_task_fatal_error();
     }
 
     err = esp_ota_end(update_handle);
@@ -265,28 +280,32 @@ static void ota_example_task(void *pvParameter)
         }
         ESP_LOGE(TAG, "esp_ota_end failed (%s)!", esp_err_to_name(err));
         http_cleanup(client);
-        task_fatal_error();
+        ota_task_fatal_error();
     }
 
     err = esp_ota_set_boot_partition(update_partition);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
         http_cleanup(client);
-        task_fatal_error();
+        ota_task_fatal_error();
     }
     ESP_LOGI(TAG, "Prepare to restart system!");
     esp_restart();
     return ;
 }
 
-static bool diagnostic(void)
+/*
+ * called after OTA image loaded at first boot to validate new image (will rollback otherwise)
+ */
+static bool image_diagnostic(void)
 {
-	return 1;
+    ESP_LOGI(TAG, "Diagnostics (return true, no test for now)");
+    return 1;
 	/*
     gpio_config_t io_conf;
     io_conf.intr_type    = GPIO_PIN_INTR_DISABLE;
     io_conf.mode         = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = (1ULL << CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
+    io_conf.pin_bit_mask = (1ULL << CONFIG_GPIO_DIAGNOSTIC);
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf);
@@ -294,83 +313,92 @@ static bool diagnostic(void)
     ESP_LOGI(TAG, "Diagnostics (5 sec)...");
     vTaskDelay(5000 / portTICK_PERIOD_MS);
 
-    bool diagnostic_is_ok = gpio_get_level(CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
+    bool diagnostic_is_ok = gpio_get_level(CONFIG_GPIO_DIAGNOSTIC);
 
-    gpio_reset_pin(CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
+    gpio_reset_pin(CONFIG_GPIO_DIAGNOSTIC);
     return diagnostic_is_ok;
     */
 }
 
-void http_request(const char* url)
+static void check_image() 
 {
-    //char local_response_buffer[MAX_HTTP_OUTPUT_BUFFER] = {0};
-    
-    /**
-     * NOTE: All the configuration parameters for http_client must be spefied either in URL or as host and path parameters.
-     * If host and path parameters are not set, query parameter will be ignored. In such cases,
-     * query parameter should be specified in URL.
-     *
-     * If URL as well as host and path parameters are specified, values of host and path will be considered.
-     */
+    uint8_t sha_256[HASH_LEN] = { 0 };
+    esp_partition_t partition;
 
-    esp_http_client_config_t config = {
-        .url = url,
-        //.event_handler = _http_event_handler,
-        //.user_data = local_response_buffer,        // Pass address of local buffer to get response
-    };
-    esp_http_client_handle_t client = esp_http_client_init( &config);
+    // get sha256 digest for the partition table
+    partition.address   = ESP_PARTITION_TABLE_OFFSET;
+    partition.size      = ESP_PARTITION_TABLE_MAX_LEN;
+    partition.type      = ESP_PARTITION_TYPE_DATA;
+    esp_partition_get_sha256(&partition, sha_256);
+    print_sha256(sha_256, "SHA-256 for the partition table: ");
 
-    // GET
-    esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d",
-                esp_http_client_get_status_code(client),
-                esp_http_client_get_content_length(client));
-    } else {
-        ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
+    // get sha256 digest for bootloader
+    partition.address   = ESP_BOOTLOADER_OFFSET;
+    partition.size      = ESP_PARTITION_TABLE_OFFSET;
+    partition.type      = ESP_PARTITION_TYPE_APP;
+    esp_partition_get_sha256(&partition, sha_256);
+    print_sha256(sha_256, "SHA-256 for bootloader: ");
+
+    // get sha256 digest for running partition
+    esp_partition_get_sha256(esp_ota_get_running_partition(), sha_256);
+    print_sha256(sha_256, "SHA-256 for current firmware: ");
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            // run diagnostic function ...
+            bool diagnostic_is_ok = image_diagnostic();
+            if (diagnostic_is_ok) {
+                ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
+                esp_ota_mark_app_valid_cancel_rollback();
+            } else {
+                ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
+                esp_ota_mark_app_invalid_rollback_and_reboot();
+            }
+        }
     }
-    //ESP_LOG_BUFFER_HEX(TAG, local_response_buffer, strlen(local_response_buffer));
-    
-    esp_http_client_cleanup(client);
 }
 
 void got_movement() {
 	    time_t now; 
 	    time( &now);
+	    ESP_LOGI( TAG, "Movement detected");
 
-	    if ((last_alarm == 0) || ((now - last_alarm) > ALARM_FLODDING_PROTECTION)) {
-		printf("time to launch alarm\n");
+	    if ((last_alarm == 0) || ((now - last_alarm) > CONFIG_ESP_ALARM_FLODDING_PROTECTION)) {
+		ESP_LOGI( TAG, "Movement: call webhook");
 		last_alarm = now; 
-		http_request( MOVEMENT_URL);
+		lazy_http_request( MOVEMENT_URL);
 	    }
 
 }
 void go_to_bed() {
-	    printf( "Stopping wifi\n");
-	    esp_wifi_stop();
-	    esp_wifi_deinit(); // stop wifi
 
-	    printf( "Starting low consumption mode (deep sleep)\n");
+	ESP_LOGI( TAG, "Starting low consumption mode (deep sleep)");
 
-	    
-	    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
 
-	    //or will wake up after to start a ping (watchdog)
-	    esp_sleep_enable_timer_wakeup( (uint64_t)WATCHDOG_PING * (uint64_t)1000000); 
+	//release Wifi driver
+	esp_wifi_stop();
+	esp_wifi_deinit();
 
-	    //Warning: can only take in consideration RTC GPIO: 0,2,4,12-15,25-27,32-39
-	    //esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_BUTTON_BOOT, ESP_EXT1_WAKEUP_ALL_LOW);
-	    
-	    //will wake up on any movement (GPIO going UP)
-	    esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_MOVEMENT_DETECTOR, ESP_EXT1_WAKEUP_ANY_HIGH);
-	    esp_sleep_enable_gpio_wakeup();
+	esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
 
-	    esp_deep_sleep_start(); //deep sleep
+	//scheddule a wake up for watchdog + periodic check
+	esp_sleep_enable_timer_wakeup( (uint64_t)CONFIG_ESP_WATCHDOG_WAKEUP * (uint64_t)1000000); 
+
+	//Warning: can only take in consideration RTC GPIO: 0,2,4,12-15,25-27,32-39
+	//esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_BUTTON_BOOT, ESP_EXT1_WAKEUP_ALL_LOW);
+
+	//will wake up on any movement (GPIO going UP)
+	esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_MOVEMENT_DETECTOR, ESP_EXT1_WAKEUP_ANY_HIGH);
+	esp_sleep_enable_gpio_wakeup();
+
+	esp_deep_sleep_start(); //deep sleep
 
 }
 void ping() {
-	printf("ping\n");
-	http_request( PING_URL);
+	ESP_LOGI( TAG, "ping (calling webhook)");
+	lazy_http_request( PING_URL);
 }
 
 static void IRAM_ATTR gpio_isr_handler(void* arg)
@@ -385,24 +413,24 @@ static void gpio_task_example(void* arg)
     for(;;) {
         if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
 
-	    uint32_t level = gpio_get_level( io_num);
-            printf("debug: GPIO[%d] intr, val: %d\n", io_num, level);
+	    //uint32_t level = gpio_get_level( io_num);
+            //ESP_LOGI(TAG, "debug: GPIO[%d] intr, val: %d", io_num, level);
 
 	    switch ( io_num) {
 
 		case GPIO_BUTTON_BOOT:
-		    printf( "Button BOOT released\n");
+		    ESP_LOGI( TAG, "Button BOOT released");
 		    ping();
 		    go_to_bed();
 		    break;
 
 		case GPIO_MOVEMENT_DETECTOR:
-		    printf( "Got movement\n");
+		    ESP_LOGI( TAG, "Got movement");
 		    got_movement();
 		    break;
 
 		default:
-		    printf("Strange case, should not occurs\n");
+		    ESP_LOGI( TAG, "Strange case: got unexpected notification on GPIO %d", io_num);
 
 	    }
 
@@ -413,13 +441,13 @@ static void gpio_task_example(void* arg)
 
 static int s_retry_num = 0;
 
-static void event_handler(void* arg, esp_event_base_t event_base,
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
+        if (s_retry_num < CONFIG_ESP_MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGI(TAG, "retry to connect to the AP");
@@ -451,19 +479,19 @@ void wifi_init_sta(void)
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
-                                                        &event_handler,
+                                                        &wifi_event_handler,
                                                         NULL,
                                                         &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
+                                                        &wifi_event_handler,
                                                         NULL,
                                                         &instance_got_ip));
 
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = EXAMPLE_ESP_WIFI_SSID,
-            .password = EXAMPLE_ESP_WIFI_PASS,
+            .ssid = CONFIG_ESP_WIFI_SSID,
+            .password = CONFIG_ESP_WIFI_PASSWORD,
             .pmf_cfg = {
                 .capable = true,
                 .required = false
@@ -487,13 +515,9 @@ void wifi_init_sta(void)
     /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
      * happened. */
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, "...");
-                 //EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s", CONFIG_ESP_WIFI_SSID, "...");
     } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, "...");
-                 //EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s", CONFIG_ESP_WIFI_SSID, "...");
     } else {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
@@ -539,42 +563,8 @@ void init_gpio(void)
 
 void app_main(void)
 {
-    uint8_t sha_256[HASH_LEN] = { 0 };
-    esp_partition_t partition;
-
-    // get sha256 digest for the partition table
-    partition.address   = ESP_PARTITION_TABLE_OFFSET;
-    partition.size      = ESP_PARTITION_TABLE_MAX_LEN;
-    partition.type      = ESP_PARTITION_TYPE_DATA;
-    esp_partition_get_sha256(&partition, sha_256);
-    print_sha256(sha_256, "SHA-256 for the partition table: ");
-
-    // get sha256 digest for bootloader
-    partition.address   = ESP_BOOTLOADER_OFFSET;
-    partition.size      = ESP_PARTITION_TABLE_OFFSET;
-    partition.type      = ESP_PARTITION_TYPE_APP;
-    esp_partition_get_sha256(&partition, sha_256);
-    print_sha256(sha_256, "SHA-256 for bootloader: ");
-
-    // get sha256 digest for running partition
-    esp_partition_get_sha256(esp_ota_get_running_partition(), sha_256);
-    print_sha256(sha_256, "SHA-256 for current firmware: ");
-
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            // run diagnostic function ...
-            bool diagnostic_is_ok = diagnostic();
-            if (diagnostic_is_ok) {
-                ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
-                esp_ota_mark_app_valid_cancel_rollback();
-            } else {
-                ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
-                esp_ota_mark_app_invalid_rollback_and_reboot();
-            }
-        }
-    }
+    //check image
+    check_image();
 
     //Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -585,51 +575,54 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     //Initialize Wifi
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
 
     //Initialize GPIO
     init_gpio();
 
-    printf("Boot number: %d\n", ++bootCount);
+    ESP_LOGI( TAG, "Boot number: %d", ++bootCount);
 
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     switch (cause) {
 
         case ESP_SLEEP_WAKEUP_UNDEFINED:
-	    printf("normal startup\n");
+	    ESP_LOGI( TAG, "normal startup");
 	    break;
 
 	case ESP_SLEEP_WAKEUP_EXT1:
-	    printf("wakeup from EXT1, meaning movement, calling web hook\n");
+	    ESP_LOGI( TAG, "wakeup from EXT1, meaning movement, calling web hook");
     	    got_movement();
 	    break;
 
 	case ESP_SLEEP_WAKEUP_TIMER:
-	    printf("wakeup from timer, calling ping\n");
+	    ESP_LOGI( TAG, "wakeup from timer, calling ping");
 	    ping();
 	    break;
 
         default:
-	    printf("Strange, got another wakup cause: %d\n", cause);
+	    ESP_LOGI( TAG, "Strange, got another wakup cause: %d", cause);
 	    break;
 
     }
 
+    time_t boot_time;
     time_t now; 
+
+    time( &boot_time);
 
     int cnt = 0;
 
     xTaskCreate(&ota_example_task, "ota_example_task", 8192, NULL, 5, NULL);
 
     while(1) {
+
 	time( &now);
-        printf("cnt: %d at %ld s\n", ++cnt, now);
+        ESP_LOGI( TAG, "main loop cnt: %d at %ld s", ++cnt, now);
         vTaskDelay(10000 / portTICK_RATE_MS);
 
-	if (cnt > 6) {
-		//after 1min, go in low consumption
+	if ((now - boot_time) >= CONFIG_ESP_TIME_POWERSAVING) {
+		//it's time for power saving
 		go_to_bed();
 	}
     }

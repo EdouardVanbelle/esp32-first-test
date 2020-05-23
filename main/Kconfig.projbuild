@@ -1,5 +1,5 @@
 # put here your custom config value
-menu "Example Configuration"
+menu "First-test project Configuration"
 config ESP_WIFI_SSID
     string "WiFi SSID"
     default "myssid"
@@ -18,17 +18,35 @@ config ESP_MAXIMUM_RETRY
         help
             Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
 
-config EXAMPLE_FIRMWARE_UPG_URL
+config ESP_FIRMWARE_UPG_URL
         string "Firmware Upgrade URL"
         default "http://192.168.2.2/firmware/first-test.bin"
         help
             URL of server which hosts the firmware image.
 
-config EXAMPLE_OTA_RECV_TIMEOUT
-        int "OTA Receive Timeout"
+config ESP_OTA_RECV_TIMEOUT
+        int "OTA Receive Timeout in millisecond"
         default 5000
         help
             Maximum time for reception
+
+config ESP_ALARM_FLODDING_PROTECTION 
+	int	"Movement alarm antiflood protection in second"
+	default 30 
+	help
+		Min time (in second) after next alarm on a movement
+
+config ESP_TIME_POWERSAVING
+	int	"Time to sleep in second (powersaving)"
+	default	30
+	help
+		Time when ESP must power save and wait for a signal
+
+config ESP_WATCHDOG_WAKEUP 
+	int	"Time to wake-up in second"
+	default	3600
+	help
+		Time when ESP must wake-up (will trigger a ping and also check for a firmware upgrade)
 
 endmenu
 
