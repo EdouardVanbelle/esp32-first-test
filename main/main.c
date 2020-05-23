@@ -15,9 +15,12 @@
 
 #include "esp_netif.h"
 #include "esp_http_client.h"
+#include "esp_sleep.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
+
+RTC_DATA_ATTR int bootCount = 0;
 
 /* The examples use WiFi configuration that you can set via project configuration menu
    If you'd rather not, just change the below entries to strings with
@@ -49,8 +52,8 @@ static const char *TAG = "first-test";
 // GPIO 0 (where BOOT Button is plugged)
 #define GPIO_BUTTON_BOOT     0 	
 
-// GPIO 23 (where to plug a PIR: passive infra red detector)
-#define GPIO_MOVEMENT_DETECTOR     23 	
+// GPIO 32 (where to plug a PIR: passive infra red detector, XXX: I choose 32 because it allow device wake up notification)
+#define GPIO_MOVEMENT_DETECTOR     32
 #define GPIO_INPUT_PIN_SEL  (1ULL<<GPIO_BUTTON_BOOT | 1ULL<<GPIO_MOVEMENT_DETECTOR)
 
 //#define GPIO_OUTPUT_IO_0     0
@@ -63,7 +66,8 @@ static const char *TAG = "first-test";
 static xQueueHandle gpio_evt_queue = NULL;
 time_t last_alarm = 0; 
 // wait ALARM_TRIGGER second before sending a new one
-#define ALARM_TRIGGER 30 
+#define ALARM_FLODDING_PROTECTION 30 
+#define WATCHDOG_PING 3600
 
 void start_mdns_service()
 {
@@ -109,8 +113,45 @@ void http_request(const char* url)
         ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
     }
     //ESP_LOG_BUFFER_HEX(TAG, local_response_buffer, strlen(local_response_buffer));
+    
+    esp_http_client_cleanup(client);
 }
 
+void got_movement() {
+	    time_t now; 
+	    time( &now);
+
+	    if ((last_alarm == 0) || ((now - last_alarm) > ALARM_FLODDING_PROTECTION)) {
+		printf("time to launch alarm\n");
+		last_alarm = now; 
+		http_request( MOVEMENT_URL);
+	    }
+
+}
+void go_to_bed() {
+	    printf( "Stopping wifi\n");
+	    esp_wifi_stop();
+	    esp_wifi_deinit(); // stop wifi
+
+	    printf( "Starting low consumption mode (deep sleep)\n");
+
+	    //Warning: can only take in consideration RTC GPIO: 0,2,4,12-15,25-27,32-39
+	    //esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_BUTTON_BOOT, ESP_EXT1_WAKEUP_ALL_LOW);
+	    
+	    //will wake up on any movement (GPIO going UP)
+	    esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_MOVEMENT_DETECTOR, ESP_EXT1_WAKEUP_ANY_HIGH);
+	    esp_sleep_enable_gpio_wakeup();
+
+	    //or will wake up after to start a ping (watchdog)
+	    esp_sleep_enable_timer_wakeup( WATCHDOG_PING * 1000000); 
+
+	    esp_deep_sleep_start(); //deep sleep
+
+}
+void ping() {
+	printf("ping\n");
+	http_request( PING_URL);
+}
 
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
@@ -131,21 +172,17 @@ static void gpio_task_example(void* arg)
 
 		case GPIO_BUTTON_BOOT:
 		    printf( "Button BOOT released\n");
-		    http_request( PING_URL);
+		    ping();
+		    go_to_bed();
 		    break;
 
 		case GPIO_MOVEMENT_DETECTOR:
 		    printf( "Got movement\n");
-
-    		    time_t now; 
-		    time( &now);
-
-		    if ((now - last_alarm) > ALARM_TRIGGER) {
-			printf("time to launch alarm\n");
-			last_alarm = now; 
-		    	http_request( MOVEMENT_URL);
-		    }
+		    got_movement();
 		    break;
+
+		default:
+		    printf("Strange case, should not occurs\n");
 
 	    }
 
@@ -295,14 +332,47 @@ void app_main(void)
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
 
+
     init_gpio();
+
+    printf("Boot number: %d\n", ++bootCount);
+
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    switch (cause) {
+
+        case ESP_SLEEP_WAKEUP_UNDEFINED:
+	    printf("normal startup\n");
+	    break;
+
+	case ESP_SLEEP_WAKEUP_EXT1:
+	    printf("wakeup from EXT1, meaning movement, calling web hook\n");
+    	    got_movement();
+	    break;
+
+	case ESP_SLEEP_WAKEUP_TIMER:
+	    printf("wakeup from timer, calling ping\n");
+	    ping();
+	    break;
+
+        default:
+	    printf("Strange, got another wakup cause: %d\n", cause);
+	    break;
+
+    }
 
     time_t now; 
 
     int cnt = 0;
+
     while(1) {
 	time( &now);
         printf("cnt: %d at %ld s\n", ++cnt, now);
         vTaskDelay(10000 / portTICK_RATE_MS);
+
+	if (cnt > 6) {
+		//after 1min, go in low consumption
+		go_to_bed();
+	}
     }
 }
