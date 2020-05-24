@@ -30,6 +30,7 @@
 static const char *TAG = "first-test";
 
 static char *movement_url = NULL;
+time_t last_activity_time = 0;
 
 #define LWIP_LOCAL_HOSTNAME "esp32player1"
 
@@ -556,6 +557,7 @@ time_t last_alarm = 0;
 void got_movement() {
 	    time_t now; 
 	    time( &now);
+    	    last_activity_time = now;
 	    ESP_LOGI( TAG, "Movement detected");
 
 	    if ((last_alarm == 0) || ((now - last_alarm) > CONFIG_ESP_ALARM_FLODDING_PROTECTION)) {
@@ -599,6 +601,7 @@ void go_to_bed() {
 }
 
 void ping() {
+    	time( &last_activity_time);
 	ESP_LOGI( TAG, "ping (calling webhook)");
 	lazy_http_request( PING_URL, _http_event_handler, NULL);
 }
@@ -612,8 +615,9 @@ struct_pc_keymap config_definition[]= {
 };
 
 
-void read_config() {
+void read_config(bool fetch_http) {
 
+	int status = 0;
 	char *config_buffer = NULL;
 
 	//FIXME: free buffers if was already defined
@@ -627,15 +631,19 @@ void read_config() {
 		ESP_LOGW(TAG, "Enable to open NVS %s", CONFIG_ESP_STORAGE_NAMESPACE);
 	}
 
-	int status = lazy_http_request( CONFIG_URL, _http_event_handler, &config_buffer);
+	if (fetch_http) {
+		
+		ESP_LOGD( TAG, "fetching config from http: %s", CONFIG_URL);
+		status = lazy_http_request( CONFIG_URL, _http_event_handler, &config_buffer);
+	}
+
 	if( (status>=200) && (status<300) && (config_buffer != NULL)) {
 		//got config  buffer from http request
-		ESP_LOGD( TAG, "config from http: %s", config_buffer);
+		ESP_LOGI( TAG, "config from http: %s", config_buffer);
 
 		//parse it
 		//FIXME: read status
 		parse_config_buffer( config_definition, config_buffer);
-		free( config_buffer);
 
 		//store values to NVS
 		for (int i=0; config_definition[i].name != NULL; i++) {
@@ -655,14 +663,13 @@ void read_config() {
 				ESP_LOGW(TAG, "unable to write %s key from NVS: %s", config_definition[i].name, esp_err_to_name( ret));
 			}
 		}
-		
 		if (nvs_commit( nvs_handle) != ESP_OK) {
 			ESP_LOGW(TAG, "unable to commit NVS");
 		}
 
 	}
 	else {
-		ESP_LOGW( TAG, "config from http failed, try to fallback to NVS");
+		ESP_LOGW( TAG, "fetching config from NVS");
 
 		//try to read previous values from NVS
 		size_t required_size;
@@ -697,6 +704,10 @@ void read_config() {
 	}
 
 	nvs_close( nvs_handle);
+
+	if (config_buffer) {
+		free( config_buffer);
+	}
 
 	if (movement_url !=  NULL) {
 		ESP_LOGI( TAG, "movement_url set to: %s", movement_url);
@@ -793,8 +804,9 @@ RTC_DATA_ATTR int bootCount = 0;
 void app_main(void)
 {
 
-	esp_log_level_set("dhcpc", ESP_LOG_DEBUG); 
-	esp_log_level_set(TAG, ESP_LOG_INFO); 
+//	esp_log_level_set("dhcpc", ESP_LOG_DEBUG); 
+//	esp_log_level_set(TAG, ESP_LOG_INFO); 
+
     //check image
     check_image();
 
@@ -814,37 +826,38 @@ void app_main(void)
 
     ESP_LOGI( TAG, "Boot number: %d", ++bootCount);
 
-
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     switch (cause) {
 
         case ESP_SLEEP_WAKEUP_UNDEFINED:
 	    ESP_LOGI( TAG, "normal startup");
+    	    read_config(true);
 	    break;
 
 	case ESP_SLEEP_WAKEUP_EXT1:
 	    ESP_LOGI( TAG, "wakeup from EXT1, meaning movement, calling web hook");
+    	    read_config(false);
     	    got_movement();
 	    break;
 
 	case ESP_SLEEP_WAKEUP_TIMER:
 	    ESP_LOGI( TAG, "wakeup from timer, calling ping");
-	    ping();
+    	    read_config(true);
+	    //ping();
 	    break;
 
         default:
 	    ESP_LOGI( TAG, "Strange, got another wakup cause: %d", cause);
+    	    read_config(true);
 	    break;
 
     }
 
-    time_t boot_time;
+
+    time( &last_activity_time);
+
     time_t now; 
-
-    time( &boot_time);
-
     int cnt = 0;
-    read_config();
 
 
     //FIXME do we need to check OTA immediately ?
@@ -856,7 +869,7 @@ void app_main(void)
         ESP_LOGI( TAG, "main loop cnt: %d at %ld s", ++cnt, now);
         vTaskDelay(10000 / portTICK_RATE_MS);
 
-	if ((now - boot_time) >= CONFIG_ESP_TIME_POWERSAVING) {
+	if ((now - last_activity_time) >= CONFIG_ESP_TIME_POWERSAVING) {
 		//it's time for power saving
 		go_to_bed();
 	}
