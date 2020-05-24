@@ -48,6 +48,10 @@ config ESP_WATCHDOG_WAKEUP
 	help
 		Time when ESP must wake-up (will trigger a ping and also check for a firmware upgrade)
 
+config ESP_STORAGE_NAMESPACE
+	string	"Namespace to store config in NVS"
+	default	"first-test"
+
 endmenu
 
     

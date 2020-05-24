@@ -8,29 +8,41 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include "driver/gpio.h"
 
 #include "esp_netif.h"
+#include "esp_err.h"
 #include "esp_http_client.h"
 #include "esp_sleep.h"
 #include "esp_ota_ops.h"
+#include "esp_tls.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
+
+#include "parse_config.h"
 
 // ---------------------------------------------------------------------------------------------------------------
 
 static const char *TAG = "first-test";
 
+static char *movement_url = NULL;
+
 #define LWIP_LOCAL_HOSTNAME "esp32player1"
 
 //#define GO_SLEEP_URL "http://nuc.lan/api/bose/Bose-Bureau/notify/shut"
 //#define MOVEMENT_URL "http://nuc.lan/api/bose/Bose-Bureau/custom-notify/fr/Mais%20qui%20ose%20passer%20devant%20moi"
-#define MOVEMENT_URL "http://nuc.lan/api/bose/Bose-Bureau/custom-notify/fr/H%C3%A9%20h%C3%A9%2C%20je%20vous%20ai%20vu%20%21"
+//#define MOVEMENT_URL "http://nuc.lan/api/bose/Bose-Bureau/custom-notify/fr/H%C3%A9%20h%C3%A9%2C%20je%20vous%20ai%20vu%20%21"
 //#define HTTP_URL "http://nuc.lan/api/bose/ALL/notify/shut"
+
+//FIXME: move it to config from HTTP ?
 #define PING_URL "http://nuc.lan/ping"
+
+//FIXME: find a smarter way (from DHCP ?, from menuconfig ?)
+#define CONFIG_URL "http://nuc.lan/provisionning/first-test.conf"
 
 // GPIO 0 (where BOOT Button is plugged)
 #define GPIO_BUTTON_BOOT     0 	
@@ -40,9 +52,13 @@ static const char *TAG = "first-test";
 
 
 
+
+
 #define BUFFSIZE 1024
 
 //  ----------------------------------------------------------------------------------- helpers
+
+#define MAX_HTTP_RECV_BUFFER 512
 
 static void http_cleanup(esp_http_client_handle_t client)
 {
@@ -51,30 +67,113 @@ static void http_cleanup(esp_http_client_handle_t client)
 }
 
 
-static bool lazy_http_request(const char* url)
+esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
+    static char *output_buffer;  // Buffer to store response of http request from event handler
+    static int output_len;       // Stores number of bytes read
+    switch(evt->event_id) {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d (full size: %d)", evt->data_len, esp_http_client_get_content_length(evt->client));
+            /*
+             *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
+             *  However, event handler can also be used in case chunked encoding is used.
+             */
+            if (!esp_http_client_is_chunked_response(evt->client)) {
+                if (output_buffer == NULL) {
+                    output_buffer = (char *) malloc(esp_http_client_get_content_length(evt->client)+1);
+                    output_len = 0;
+                    if (output_buffer == NULL) {
+                        ESP_LOGE(TAG, "Failed to allocate memory for output buffer");
+                        return ESP_FAIL;
+                    }
+		    if (evt->user_data) {
+		    	*((char **)evt->user_data) = output_buffer;
+		    }
+                }
+                memcpy(output_buffer + output_len, evt->data, evt->data_len);
+                output_len += evt->data_len;
+            }
+
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
+            if (output_buffer != NULL) {
+
+                // Response is accumulated in output_buffer. Uncomment the below line to print the accumulated response
+		output_buffer[output_len]='\0'; //close buffer, consider it as a string
+
+		if ( evt->user_data == NULL ) {
+			evt->user_data = output_buffer;
+		}
+                //ESP_LOGD(TAG, "answer: %s", output_buffer);
+
+	        if (evt->user_data == NULL) {
+                	free(output_buffer); 
+		}
+                output_buffer = NULL;
+                output_len = 0;
+            }
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGD(TAG, "HTTP_EVENT_DISCONNECTED");
+            int mbedtls_err = 0;
+            esp_err_t err = esp_tls_get_and_clear_last_error(evt->data, &mbedtls_err, NULL);
+            if (err != 0) {
+                if (output_buffer != NULL) {
+                    free(output_buffer);
+                    output_buffer = NULL;
+                    output_len = 0;
+                }
+                ESP_LOGI(TAG, "Last esp error code: 0x%x", err);
+                ESP_LOGI(TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
+            }
+            break;
+    }
+    return ESP_OK;
+}
+
+//FIXME: find a way to output buffer
+static int lazy_http_request(const char* url, http_event_handle_cb event_handler, char **buffer)
+{
+    int status = 900;
 
     ESP_LOGI(TAG, "HTTP GET start query %s", url);
     esp_http_client_config_t config = {
-        .url = url,
+        .url           = url,
+	.event_handler = event_handler,
+	.user_data     = buffer 
     };
     esp_http_client_handle_t client = esp_http_client_init( &config);
 
     // GET
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
+	status = esp_http_client_get_status_code(client);
         ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d",
                 esp_http_client_get_status_code(client),
                 esp_http_client_get_content_length(client));
+
+	
     } else {
         ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
     }
-    //ESP_LOG_BUFFER_HEX(TAG, local_response_buffer, strlen(local_response_buffer));
-    
+    	
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    return (err == ESP_OK);
+    return status;
 }
 
 
@@ -273,6 +372,8 @@ static void ota_task(void *pvParameter)
         ota_task_fatal_error();
     }
     ESP_LOGI(TAG, "Prepare to restart system!");
+
+    fflush(stdout);
     esp_restart();
     return ;
 }
@@ -458,9 +559,14 @@ void got_movement() {
 	    ESP_LOGI( TAG, "Movement detected");
 
 	    if ((last_alarm == 0) || ((now - last_alarm) > CONFIG_ESP_ALARM_FLODDING_PROTECTION)) {
-		ESP_LOGI( TAG, "Movement: call webhook");
 		last_alarm = now; 
-		lazy_http_request( MOVEMENT_URL);
+		if (movement_url != NULL) {
+			ESP_LOGI( TAG, "Movement: call webhook");
+			lazy_http_request( movement_url, NULL, NULL);
+		}
+		else {
+			ESP_LOGW( TAG, "Movement: webhook not defined !");
+		}
 	    }
 
 }
@@ -484,16 +590,118 @@ void go_to_bed() {
 	esp_sleep_enable_ext1_wakeup( 1ULL<<GPIO_MOVEMENT_DETECTOR, ESP_EXT1_WAKEUP_ANY_HIGH);
 	esp_sleep_enable_gpio_wakeup();
 
+
+	ESP_LOGI( TAG, "See you on next wake-up");
+    	fflush(stdout);
+
 	esp_deep_sleep_start(); //deep sleep
 
 }
 
 void ping() {
 	ESP_LOGI( TAG, "ping (calling webhook)");
-	lazy_http_request( PING_URL);
+	lazy_http_request( PING_URL, _http_event_handler, NULL);
 }
 
 
+//XXX Take care that keys must be < 16 chars due to NVS restriction
+struct_pc_keymap config_definition[]= {
+	{ .name="movement_url", .target=&movement_url, .type=TYPE_STRING, .defined=0, .mandatory=1  },
+	//{ .name="watchdog_wakeup",  .target=&watchdog_wakeup,  .type=TYPE_INT,    .defined=0, .mandatory=0  },
+	{ .name=NULL,                                                                                      } //mark end of array
+};
+
+
+void read_config() {
+
+	char *config_buffer = NULL;
+
+	//FIXME: free buffers if was already defined
+
+	//FIXME: chould use FAT partition to store config rather NVS which is not recommended for strings, will be simplier
+
+	nvs_handle_t nvs_handle;
+    	esp_err_t ret;
+
+	if (nvs_open(CONFIG_ESP_STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle) != ESP_OK) {
+		ESP_LOGW(TAG, "Enable to open NVS %s", CONFIG_ESP_STORAGE_NAMESPACE);
+	}
+
+	int status = lazy_http_request( CONFIG_URL, _http_event_handler, &config_buffer);
+	if( (status>=200) && (status<300) && (config_buffer != NULL)) {
+		//got config  buffer from http request
+		ESP_LOGD( TAG, "config from http: %s", config_buffer);
+
+		//parse it
+		//FIXME: read status
+		parse_config_buffer( config_definition, config_buffer);
+		free( config_buffer);
+
+		//store values to NVS
+		for (int i=0; config_definition[i].name != NULL; i++) {
+			ret = ESP_FAIL;
+			switch( config_definition[i].type) {
+
+				case TYPE_STRING:
+					ret = nvs_set_str(nvs_handle, config_definition[i].name, *((char **)( config_definition[i].target)) );
+					break;
+
+				case TYPE_INT:
+					ret = nvs_set_i64(nvs_handle, config_definition[i].name, *((int64_t *)( config_definition[i].target)) );
+					break;
+			
+			}
+			if (ret != ESP_OK) {
+				ESP_LOGW(TAG, "unable to write %s key from NVS: %s", config_definition[i].name, esp_err_to_name( ret));
+			}
+		}
+		
+		if (nvs_commit( nvs_handle) != ESP_OK) {
+			ESP_LOGW(TAG, "unable to commit NVS");
+		}
+
+	}
+	else {
+		ESP_LOGW( TAG, "config from http failed, try to fallback to NVS");
+
+		//try to read previous values from NVS
+		size_t required_size;
+
+		//store values to NVS
+		for (int i=0; config_definition[i].name != NULL; i++) {
+			ret = ESP_FAIL;
+
+			switch( config_definition[i].type) {
+
+				case TYPE_STRING:
+					ret = nvs_get_str(nvs_handle, config_definition[i].name, NULL, &required_size );
+					if (ret != ESP_OK) break;
+					char *buffer = malloc(required_size);
+					if (buffer == NULL) { ret = ESP_ERR_NO_MEM; break; }
+					ret = nvs_get_str(nvs_handle, config_definition[i].name, buffer, &required_size);
+					if (ret == ESP_OK) {
+						//point target to buffer
+						*((char **) (config_definition[i].target)) = buffer;
+					}
+					break;
+
+				case TYPE_INT:
+					ret = nvs_get_i64(nvs_handle, config_definition[i].name, (int64_t *)( config_definition[i].target) );
+					break;
+			
+			}
+			if (ret != ESP_OK) {
+				ESP_LOGW(TAG, "unable to read %s key from NVS: %s", config_definition[i].name, esp_err_to_name( ret));
+			}
+		}
+	}
+
+	nvs_close( nvs_handle);
+
+	if (movement_url !=  NULL) {
+		ESP_LOGI( TAG, "movement_url set to: %s", movement_url);
+	}
+}
 // -------------------------------------------------------------------------------- gpio
 
 
@@ -523,7 +731,7 @@ static void gpio_task(void* arg)
 		case GPIO_BUTTON_BOOT:
 		    ESP_LOGI( TAG, "Button BOOT released");
 		    ping();
-		    go_to_bed();
+		    //go_to_bed();
 		    break;
 
 		case GPIO_MOVEMENT_DETECTOR:
@@ -584,6 +792,9 @@ RTC_DATA_ATTR int bootCount = 0;
 
 void app_main(void)
 {
+
+	esp_log_level_set("dhcpc", ESP_LOG_DEBUG); 
+	esp_log_level_set(TAG, ESP_LOG_INFO); 
     //check image
     check_image();
 
@@ -633,6 +844,8 @@ void app_main(void)
     time( &boot_time);
 
     int cnt = 0;
+    read_config();
+
 
     //FIXME do we need to check OTA immediately ?
     xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
