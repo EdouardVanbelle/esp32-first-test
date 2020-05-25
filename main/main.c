@@ -30,7 +30,20 @@
 static const char *TAG = "first-test";
 
 static char *movement_url = NULL;
+
+RTC_DATA_ATTR int    bootCount          = 0;
+RTC_DATA_ATTR time_t last_ota_check     = 0;
+RTC_DATA_ATTR time_t last_ping_time     = 0;
+
 time_t last_activity_time = 0;
+
+
+
+#define CONFIG_ESP_OTA_FREQUENCY 120
+#define CONFIG_ESP_PING_FREQUENCY 60
+
+//overwrite it
+#define CONFIG_ESP_TIME_POWERSAVING 1800
 
 #define LWIP_LOCAL_HOSTNAME "esp32player1"
 
@@ -186,6 +199,7 @@ extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
 
 #define OTA_URL_SIZE 256
+
 
 #define HASH_LEN 32 /* SHA-256 digest length */
 static void print_sha256 (const uint8_t *image_hash, const char *label)
@@ -445,6 +459,14 @@ static void check_image()
     }
 }
 
+void ota_check() {
+    BaseType_t ret = xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
+    if (ret != pdPASS) {
+	ESP_LOGE(TAG, "Unable to create ota_task: %d", ret);
+    }
+}
+
+
 // -------------------------------------------------------------------------- wifi
 
 /* The event group allows multiple bits for each event, but we only care about two events:
@@ -620,8 +642,6 @@ void read_config(bool fetch_http) {
 	int status = 0;
 	char *config_buffer = NULL;
 
-	//FIXME: free buffers if was already defined
-
 	//FIXME: chould use FAT partition to store config rather NVS which is not recommended for strings, will be simplier
 
 	nvs_handle_t nvs_handle;
@@ -687,6 +707,9 @@ void read_config(bool fetch_http) {
 					if (buffer == NULL) { ret = ESP_ERR_NO_MEM; break; }
 					ret = nvs_get_str(nvs_handle, config_definition[i].name, buffer, &required_size);
 					if (ret == ESP_OK) {
+						//free eventual previous data
+						if (*((char **) (config_definition[i].target)) != NULL)
+							free(*((char **) (config_definition[i].target)));
 						//point target to buffer
 						*((char **) (config_definition[i].target)) = buffer;
 					}
@@ -786,7 +809,7 @@ void init_gpio(void)
     //create a queue to handle gpio event from isr
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     //start gpio task
-    xTaskCreate(gpio_task, "gpio_task", 2048, NULL, 10, NULL);
+    xTaskCreate(gpio_task, "gpio_task", 20480, NULL, 10, NULL); //take more memory to allow buffer call
 
     //install gpio isr service
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
@@ -798,8 +821,6 @@ void init_gpio(void)
 
 
 // -------------------------------------------------------------------------- app_main
-
-RTC_DATA_ATTR int bootCount = 0;
 
 void app_main(void)
 {
@@ -813,16 +834,14 @@ void app_main(void)
     //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
 
     //Initialize Wifi
     wifi_start();
 
-    //Initialize GPIO
-    init_gpio();
 
     ESP_LOGI( TAG, "Boot number: %d", ++bootCount);
 
@@ -831,47 +850,63 @@ void app_main(void)
 
         case ESP_SLEEP_WAKEUP_UNDEFINED:
 	    ESP_LOGI( TAG, "normal startup");
-    	    read_config(true);
+    	    read_config( true);
+	    ota_check();
 	    break;
 
 	case ESP_SLEEP_WAKEUP_EXT1:
 	    ESP_LOGI( TAG, "wakeup from EXT1, meaning movement, calling web hook");
-    	    read_config(false);
+    	    read_config( false);
     	    got_movement();
 	    break;
 
 	case ESP_SLEEP_WAKEUP_TIMER:
 	    ESP_LOGI( TAG, "wakeup from timer, calling ping");
-    	    read_config(true);
-	    //ping();
+    	    read_config( true);
 	    break;
 
         default:
 	    ESP_LOGI( TAG, "Strange, got another wakup cause: %d", cause);
-    	    read_config(true);
+    	    read_config( true);
 	    break;
 
     }
 
+    //Initialize GPIO
+    init_gpio();
 
+    //reset activity time on startup
     time( &last_activity_time);
 
     time_t now; 
     int cnt = 0;
 
-
-    //FIXME do we need to check OTA immediately ?
-    xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
-
     while(1) {
 
 	time( &now);
         ESP_LOGI( TAG, "main loop cnt: %d at %ld s", ++cnt, now);
-        vTaskDelay(10000 / portTICK_RATE_MS);
+
+	if ((now - last_ping_time) >= CONFIG_ESP_PING_FREQUENCY) {
+		last_activity_time = now;
+		last_ping_time = now;
+		ping();
+	}
+	if ((now - last_ota_check) >= CONFIG_ESP_OTA_FREQUENCY) {
+		//will not request a deep sleep while checking OTA
+		last_activity_time = now;
+		last_ota_check = now;
+
+		//reread config from http call
+    	    	read_config( true);
+		ota_check();
+	}
 
 	if ((now - last_activity_time) >= CONFIG_ESP_TIME_POWERSAVING) {
 		//it's time for power saving
 		go_to_bed();
 	}
+
+        vTaskDelay(10000 / portTICK_RATE_MS);
     }
+
 }

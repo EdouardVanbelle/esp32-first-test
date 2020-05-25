@@ -79,7 +79,10 @@ int parse_config_buffer( struct_pc_keymap definition[], const char *buffer_to_ba
 					//assign value to target
 					switch ( definition[i].type) {
 						case TYPE_STRING:
-							//XXX: what about freeing previous entry if not null ?
+							//Fee eventual previous data
+							if (*((char **) (definition[i].target)) != NULL)
+								free( *((char **) (definition[i].target)));
+
 							*((char **) (definition[i].target)) = strdup( value);
 							break;
 
