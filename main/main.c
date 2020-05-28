@@ -41,9 +41,11 @@ time_t last_activity_time = 0;
 
 #define CONFIG_ESP_OTA_FREQUENCY 120
 #define CONFIG_ESP_PING_FREQUENCY 60
+#define CONFIG_ESP_ALARM_FLODDING_PROTECTION 600
 
 //overwrite it
-#define CONFIG_ESP_TIME_POWERSAVING 1800
+//#define CONFIG_ESP_TIME_POWERSAVING 1800
+#define CONFIG_ESP_TIME_POWERSAVING 0
 
 #define LWIP_LOCAL_HOSTNAME "esp32player1"
 
@@ -63,6 +65,8 @@ time_t last_activity_time = 0;
 
 // GPIO 32 (where to plug a PIR: passive infra red detector, XXX: I choose 32 because it allow device wake up notification)
 #define GPIO_MOVEMENT_DETECTOR     32
+// GPIO 33 (where to plug a Flame detector, XXX: I choose 33 because it allow device wake up notification)
+#define GPIO_FLAME_DETECTOR         33
 
 
 
@@ -595,6 +599,26 @@ void got_movement() {
 
 }
 
+int previous_flame_status = -1;
+void got_flame_change( int level) {
+	time_t now; 
+	time( &now);
+    	last_activity_time = now;
+
+	//check if any change
+	if (previous_flame_status != level ) {
+		switch( level) {
+			case 1:
+	    			ESP_LOGI( TAG, "Flame detected");
+				break;
+			case 0:
+	    			ESP_LOGI( TAG, "no flame anymore");
+				break;
+		}
+		previous_flame_status = level;
+	}
+}
+
 void go_to_bed() {
 
 	ESP_LOGI( TAG, "Starting low consumption mode (deep sleep)");
@@ -739,17 +763,19 @@ void read_config(bool fetch_http) {
 // -------------------------------------------------------------------------------- gpio
 
 
-#define GPIO_INPUT_PIN_SEL  (1ULL<<GPIO_BUTTON_BOOT | 1ULL<<GPIO_MOVEMENT_DETECTOR)
+#define GPIO_INPUT_PIN_SEL  (1ULL<<GPIO_BUTTON_BOOT | 1ULL<<GPIO_MOVEMENT_DETECTOR | 1ULL<<GPIO_FLAME_DETECTOR)
 #define ESP_INTR_FLAG_DEFAULT 0
 
 static xQueueHandle gpio_evt_queue = NULL;
 
+/* enqueue event (minimalist function) */
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
     uint32_t gpio_num = (uint32_t) arg;
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
 }
 
+/* treat event in a queue */
 static void gpio_task(void* arg)
 {
     uint32_t io_num;
@@ -757,7 +783,7 @@ static void gpio_task(void* arg)
 
         if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
 
-	    //uint32_t level = gpio_get_level( io_num);
+	    uint32_t level = gpio_get_level( io_num);
             //ESP_LOGI(TAG, "debug: GPIO[%d] intr, val: %d", io_num, level);
 
 	    switch ( io_num) {
@@ -769,8 +795,13 @@ static void gpio_task(void* arg)
 		    break;
 
 		case GPIO_MOVEMENT_DETECTOR:
-		    ESP_LOGI( TAG, "Got movement");
+		    //ESP_LOGI( TAG, "Got movement");
 		    got_movement();
+		    break;
+
+		case GPIO_FLAME_DETECTOR:
+		    //ESP_LOGI( TAG, "Flame is now at: %d", level);
+		    got_flame_change( level);
 		    break;
 
 		default:
@@ -797,25 +828,31 @@ void init_gpio(void)
     io_conf.mode = GPIO_MODE_INPUT;
 
     //enable pull-up mode
-    io_conf.pull_up_en = 1;
+    io_conf.pull_up_en = 0;
 
     gpio_config(&io_conf);
 
      //change gpio intrrupt type for one pin
      // GPIO_INTR_POSEDGE  = rising up, GPIO_INTR_NEGEDGE = falling down, GPIO_INTR_ANYEDGE = both
-    gpio_set_intr_type(GPIO_BUTTON_BOOT, GPIO_INTR_POSEDGE);       // on rising up = when button is released
+    gpio_set_intr_type(GPIO_BUTTON_BOOT,       GPIO_INTR_POSEDGE); // on rising up = when button is released
     gpio_set_intr_type(GPIO_MOVEMENT_DETECTOR, GPIO_INTR_POSEDGE); // when movement is detected
+    gpio_set_intr_type(GPIO_FLAME_DETECTOR,    GPIO_INTR_ANYEDGE); // on both changes
+
+    //gpio_pulldown_en( GPIO_FLAME_DETECTOR);
 
     //create a queue to handle gpio event from isr
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+
     //start gpio task
     xTaskCreate(gpio_task, "gpio_task", 20480, NULL, 10, NULL); //take more memory to allow buffer call
 
     //install gpio isr service
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+
     //hook isr handler for specific gpio pin
-    gpio_isr_handler_add(GPIO_BUTTON_BOOT, gpio_isr_handler, (void*) GPIO_BUTTON_BOOT);
+    gpio_isr_handler_add(GPIO_BUTTON_BOOT,       gpio_isr_handler, (void*) GPIO_BUTTON_BOOT);
     gpio_isr_handler_add(GPIO_MOVEMENT_DETECTOR, gpio_isr_handler, (void*) GPIO_MOVEMENT_DETECTOR);
+    gpio_isr_handler_add(GPIO_FLAME_DETECTOR,    gpio_isr_handler, (void*) GPIO_FLAME_DETECTOR);
 
 }
 
@@ -901,7 +938,7 @@ void app_main(void)
 		ota_check();
 	}
 
-	if ((now - last_activity_time) >= CONFIG_ESP_TIME_POWERSAVING) {
+	if ((CONFIG_ESP_TIME_POWERSAVING != 0) && (now - last_activity_time) >= CONFIG_ESP_TIME_POWERSAVING) {
 		//it's time for power saving
 		go_to_bed();
 	}
